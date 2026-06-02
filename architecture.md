@@ -263,3 +263,116 @@ Plus required **EBS gp3** data volume at $0.08/GB-month: 100 GB → +$8, 200 GB 
 | Defer ClickHouse, serve analytics from Postgres | **−$70–150/mo** | revisit once query latency actually demands a columnar store |
 
 > **Excluded:** one-time setup/data-migration, developer/CI environments, support plans, and any third-party MLS/data-source licensing. A non-prod (single-AZ, no replicas, Spot-heavy) copy of this stack typically runs **~40–50% of prod**.
+
+---
+
+## 5. Alternative: Cloudflare Infrastructure
+
+The same architecture re-platformed onto **Cloudflare Workers** and its ecosystem. The model is fundamentally different from AWS: instead of always-on VMs/containers in a VPC, almost everything is **serverless, edge-distributed, and scales to zero**. That flips the cost structure — but two of our stateful stores (Postgres, ClickHouse) have **no first-party Cloudflare equivalent** and must stay external.
+
+### Service mapping (AWS → Cloudflare)
+
+| AWS component | Cloudflare equivalent | Fit |
+|---------------|----------------------|-----|
+| EventBridge Scheduler | **Cron Triggers** (on a Worker) | ✅ Clean |
+| Short scrapers (Fargate Spot) | **Workers** | ⚠️ Workers cap CPU time (≤5 min); fine for short scrapes, but no long-running process model |
+| Long scraper ~1.5h (Fargate On-Demand) | **Cloudflare Containers** (or chunked via **Durable Object** alarms) | ⚠️ Doesn't fit the Workers model — needs Containers (per-second billed) or work split into DO-alarm chunks |
+| SQS + DLQ | **Cloudflare Queues** (built-in DLQ/retries) | ✅ Clean |
+| Batch consumer (Fargate) | **Workers** (Queue consumer, batched) | ✅ Clean |
+| Postgres (RDS/Aurora) | **No native Postgres.** External (Neon/Supabase) via **Hyperdrive** pooling, *or* **D1** (SQLite) | ❌ No managed Postgres. D1 ≠ Postgres semantics; real ACID core stays external |
+| ClickHouse (EC2) | **No native OLAP.** **Workers Analytics Engine** (time-series, SQL API) *or* external ClickHouse Cloud | ❌ Biggest gap. Analytics Engine covers basic aggregations but isn't a ClickHouse replacement |
+| S3 | **R2** (S3-compatible, **zero egress fees**) | ✅ Better — no egress cost |
+| Dashboard API (Bun/Hono Fargate) | **Workers** — **Hono runs natively on Workers** | ✅ Excellent — same framework, no rewrite |
+| PDF worker (Lambda) | **Workers + Browser Rendering API** | ✅ Clean |
+| Notifier (SES/SNS) | **Email Routing** (inbound) + external send (Resend/SES) | ⚠️ No native bulk email send |
+| Secrets Manager | **Workers Secrets / Secrets Store** | ✅ Clean |
+| VPC endpoints / NAT | **N/A** — no VPC; Workers run on the edge | ✅ Cost eliminated |
+| CloudWatch | **Workers Analytics + Logpush + Tail Workers** | ✅ Clean |
+
+### Architecture on Cloudflare
+
+```mermaid
+flowchart TB
+    subgraph Edge["☁️ Cloudflare Edge (scales to zero)"]
+        CRON["Cron Triggers"]
+        WS["Scraper Workers<br/>(9 short)"]
+        CONT["Container / Durable Object<br/>(1 long scraper ~1.5h)"]
+        Q["Cloudflare Queues<br/>(+ built-in DLQ)"]
+        CONS["Consumer Worker<br/>enrich · insert · archive"]
+        API["Dashboard API<br/>Hono on Workers"]
+        AE[("Analytics Engine<br/>aggregations")]
+        R2[("R2<br/>Parquet + PDFs<br/>zero egress")]
+        PDF["PDF Worker<br/>+ Browser Rendering"]
+        HD["Hyperdrive<br/>(pooling/cache)"]
+    end
+
+    subgraph External["🔌 External (no CF-native option)"]
+        PG[("Postgres<br/>Neon / Supabase — CP")]
+        CH[("ClickHouse Cloud<br/>or self-host VM")]
+        MAIL["Resend / SES<br/>(email send)"]
+    end
+
+    Users(["👤 Users"])
+
+    CRON --> WS & CONT
+    WS --> Q
+    CONT --> Q
+    Q --> CONS
+    CONS --> R2
+    CONS --> AE
+    CONS -. or external .-> CH
+    CONS --> HD --> PG
+    API --> HD
+    API --> AE
+    API --> R2
+    API --> Users
+    API --> PDF --> R2
+    API --> MAIL --> Users
+
+    style R2 fill:#238636,color:#fff
+    style PG fill:#1f6feb,color:#fff
+    style CH fill:#d29922,color:#fff
+    style AE fill:#d29922,color:#fff
+    style External fill:#161b22,color:#fff
+```
+
+### Cost comparison
+
+Two Cloudflare variants, same workload (10–50 users, once-daily ingest of 10–50k records). All USD/month.
+
+| Component | AWS (from §4) | **CF-native** (Analytics Engine + D1) | **CF + external Postgres/ClickHouse** (faithful) |
+|-----------|--------------:|--------------------------------------:|------------------------------------------------:|
+| Compute (API + scrapers + consumer + PDF) | $30–95 | **$5** Workers Paid base¹ | **$5** Workers Paid base¹ |
+| Long-scraper runtime | (in above) | $5–15 Containers | $5–15 Containers |
+| Queue | $0–2 | $0–1 Queues | $0–1 Queues |
+| Object storage | $1–8 | $1–3 R2 (no egress) | $1–3 R2 (no egress) |
+| Transactional store | $50–120 | $0–5 D1 | $19–69 Neon/Supabase + Hyperdrive (free) |
+| Analytics / OLAP store | $125–145 | $1–7 Analytics Engine | $50–200 ClickHouse Cloud / self-host |
+| Email | $1–10 | $0–20 Resend/SES | $0–20 Resend/SES |
+| Secrets / observability | $7–25 | $0–3 (mostly included) | $0–3 (mostly included) |
+| VPC endpoints / NAT / ALB | $35–130 | **$0** (no VPC, no LB) | **$0** |
+| **Total** | **≈ $300–420** | **≈ $15–55/month** | **≈ $80–300/month** |
+
+¹ Workers Paid is $5/mo and includes 10M requests + 30M CPU-ms — far above this workload's needs, so all Worker-based components share that one base fee.
+
+### Trade-offs
+
+**Where Cloudflare wins**
+- **Cost & elasticity at this scale.** No always-on Postgres Multi-AZ, ClickHouse EC2, ALB, or VPC endpoints — the four lines that dominate the AWS bill. Idle time costs ~nothing; the CF-native path is **~10–20× cheaper**.
+- **R2 zero egress** — meaningful once dashboards/PDFs are served at volume.
+- **Hono runs unchanged on Workers** — the Dashboard API ports with little to no rewrite.
+- **No VPC/NAT/endpoint tax**, no instance patching, global edge latency for free.
+
+**Where Cloudflare hurts**
+- **No managed Postgres.** Your **CP money/identity core** either moves to D1 (SQLite — different consistency/SQL semantics, read-replica eventual consistency) or stays on **external Postgres** (Neon/Supabase) reached via Hyperdrive. The faithful path keeps Postgres external, so it's "Cloudflare for the edge, someone else for the system of record."
+- **No managed ClickHouse.** **Analytics Engine** handles basic time-series aggregations (the stated "lightweight analytics" need) but is **not** a ClickHouse replacement — no `ReplacingMergeTree` dedup, narrower query surface, different data model. Faithful parity means an **external ClickHouse**, which erases much of the savings.
+- **Long-running scrapers fight the Workers model.** The 1.5h job needs **Containers** or must be re-architected into **Durable Object alarm chunks** with the heartbeat/overlap-guard logic rebuilt.
+- **CAP picture shifts.** The AWS design's crisp "Postgres = CP, pipeline = AP" split blurs: Workers/Queues/R2/Analytics Engine are all edge-AP, and D1's primary-plus-replica model has its own eventual-consistency behavior on reads.
+
+### Verdict
+
+- **If "lightweight analytics with basic aggregations" is the real long-term ceiling** → the **CF-native** path (Workers + Queues + R2 + Analytics Engine + D1) is dramatically cheaper (**~$15–55/mo**) and operationally simpler. This aligns with §2's own observation that ClickHouse isn't yet justified by data volume.
+- **If you need true ClickHouse semantics and Postgres ACID guarantees** → use **Cloudflare for the edge/ingest/serving tier** and keep **Postgres + ClickHouse external** (**~$80–300/mo**). You still shed the VPC/NAT/ALB tax and gain R2's zero egress, but the stateful stores — and most of the cost — live elsewhere.
+- **Net:** Cloudflare is the stronger fit precisely *because* this workload is small and bursty. AWS earns its premium only when you genuinely need the managed, always-on, strongly-consistent stores (RDS Multi-AZ, self-tuned ClickHouse) that Cloudflare doesn't natively provide.
+
+> **Pricing note:** Cloudflare figures use public list pricing (Workers Paid $5/mo base, Queues ~$0.40/M ops, R2 $0.015/GB + $0 egress, D1/Analytics Engine within or just above included tiers at this volume). Containers and Browser Rendering bill per resource-second/request and are estimated at low daily usage. External Postgres/ClickHouse/email are third-party list prices.
