@@ -2,7 +2,9 @@
 
 **Real-Estate Analytics & Reporting Platform**
 
-A data-intensive platform ingesting **~100k records/day** from **10 MLS scrapers**. It is deliberately split into a **strongly-consistent transactional core** and an **availability-first analytics pipeline**.
+A data-intensive platform ingesting **~100k records/day** from **10 MLS scrapers**. It runs on a **single strongly-consistent Postgres core** — transactional tables in a row-store schema, and analytics in a **TimescaleDB** schema (hypertables + columnar compression + continuous aggregates) — so one database serves both OLTP and OLAP.
+
+> **Design change:** this revision **replaces the separate ClickHouse cluster with TimescaleDB inside Postgres.** The dual-store (Postgres + ClickHouse), the dual-write, the cross-store reconciliation job, and the CP/AP split between two databases are all eliminated. See [§2](#2-key-architecture-decisions) for the rationale.
 
 ---
 
@@ -11,8 +13,8 @@ A data-intensive platform ingesting **~100k records/day** from **10 MLS scrapers
 ### Data Flow
 
 ```
-EventBridge → Scrapers (Fargate) → SQS (+ DLQ) → Batch consumer → ClickHouse + S3 (Parquet)
-Dashboard API → reads Postgres + ClickHouse → Users
+EventBridge → Scrapers (Fargate) → SQS (+ DLQ) → Batch consumer → Postgres/TimescaleDB + S3 (Parquet)
+Dashboard API → reads Postgres (core primary + analytics read replica) → Users
 ```
 
 ### Architecture Diagram
@@ -34,14 +36,16 @@ flowchart TB
     end
 
     subgraph Processing["⚙️ Processing — Fargate"]
-        BC["Batch Consumer<br/>enrich · bulk-insert · archive"]
+        BC["Batch Consumer<br/>enrich · COPY upsert · archive"]
     end
 
-    subgraph Stores["🗄️ Data Stores"]
-        PG[("Postgres / Aurora<br/>CP — users, invoicing,<br/>scraper state, dimensions")]
-        CH[("ClickHouse — EC2<br/>AP — ReplacingMergeTree")]
-        S3[("S3<br/>Parquet + PDF reports")]
+    subgraph PG["🐘 Postgres + TimescaleDB (single store)"]
+        CORE[("schema: core<br/>row-store — CP<br/>users, invoicing,<br/>scraper state, dimensions")]
+        ANALYTICS[("schema: analytics<br/>hypertable + columnar compression<br/>+ continuous aggregates")]
+        REPLICA[("read replica<br/>dashboard reads")]
     end
+
+    S3[("S3<br/>Parquet + PDF reports")]
 
     subgraph Serving["🌐 Serving"]
         API["Dashboard API<br/>Bun/Hono — Fargate / Lambda"]
@@ -60,22 +64,25 @@ flowchart TB
     SQS -. poison .-> DLQ
     DLQ -. replay .-> SQS
     SQS --> BC
-    S9 -. run-state .-> PG
-    S1 -. run-state .-> PG
+    S9 -. run-state .-> CORE
+    S1 -. run-state .-> CORE
 
     BC -- "1. archive" --> S3
-    BC -- "2. bulk insert" --> CH
-    BC -- "enrich (dimensions)" --> PG
+    BC -- "2. COPY + ON CONFLICT" --> ANALYTICS
+    BC -- "enrich (local join)" --> CORE
+    CORE -. stream .-> REPLICA
+    ANALYTICS -. stream .-> REPLICA
 
-    API --> PG
-    API --> CH
+    API --> CORE
+    API --> REPLICA
     API --> Users
     API --> PDF
     PDF --> S3
     NOTIF --> Users
 
-    style PG fill:#1f6feb,color:#fff
-    style CH fill:#d29922,color:#fff
+    style CORE fill:#1f6feb,color:#fff
+    style ANALYTICS fill:#1f6feb,color:#fff
+    style REPLICA fill:#388bfd,color:#fff
     style S3 fill:#238636,color:#fff
     style DLQ fill:#da3633,color:#fff
 ```
@@ -86,13 +93,12 @@ flowchart TB
 |-----------|------|
 | **Ingestion** | 10 Fargate scrapers (9 short on **Spot**, 1 long ~1.5h **on-demand**). Triggered by EventBridge Scheduler. Stream rows to SQS; report run-state to Postgres. |
 | **Queue** | SQS + DLQ. Durable buffer; poison messages isolated for replay. |
-| **Processing** | Batch consumer (Fargate). Enriches rows from Postgres dimensions, bulk-inserts to ClickHouse, archives Parquet to S3. |
-| **Transactional store** | Postgres (RDS/Aurora). Users, properties, invoicing, scraper state, dimension data. |
-| **Analytics store** | ClickHouse (self-hosted EC2). Hot query store; `ReplacingMergeTree` for dedup. |
+| **Processing** | Batch consumer (Fargate). Enriches rows from dimension tables (now a **local join** — same DB), bulk `COPY`s into the analytics hypertable with `ON CONFLICT` dedup, archives Parquet to S3. |
+| **Data store** | **Postgres + TimescaleDB** (self-managed EC2 *or* Timescale Cloud). `core` schema = transactional (users, invoicing, scraper state, dimensions); `analytics` schema = hypertable with **columnar compression** + **continuous aggregates**. **Read replica** serves dashboard reads. |
 | **Archive** | S3. Parquet (verification + replay) and generated PDF reports. |
-| **Serving** | Bun/Hono Dashboard API (Fargate, or Lambda + RDS Proxy). Reads both stores. |
+| **Serving** | Bun/Hono Dashboard API (Fargate, or Lambda + RDS Proxy). Reads `core` on the primary, analytics rollups on the read replica. |
 | **Async** | PDF worker (Lambda → S3); Notifier (SES/SNS) for client reminders. |
-| **Ops** | Secrets Manager; VPC endpoints (no NAT); CloudWatch alarms (DLQ depth, merge lag); Postgres↔ClickHouse count reconciliation. |
+| **Ops** | Secrets Manager; VPC endpoints (no NAT); CloudWatch alarms (DLQ depth, **replication lag**, **continuous-aggregate refresh lag**). **No cross-store reconciliation needed** — one source of truth. |
 
 ---
 
@@ -100,24 +106,28 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    A["Scrapers never insert<br/>into ClickHouse directly"] --> A1["Batched inserts via consumer<br/>avoid 'too many parts' failure"]
-    B["ReplacingMergeTree dedup"] --> B1["Pipeline is idempotent<br/>& safely retryable"]
-    C["Dual-write order:<br/>S3 → ClickHouse → delete SQS msg"] --> C1["Durable copy exists<br/>before anything can fail"]
-    D["Long scraper on-demand<br/>(not Spot)"] --> D1["Incremental stream +<br/>overlap guard + heartbeat"]
-    E["ClickHouse justified by<br/>query latency only"] --> E1["~36M rows/year —<br/>Postgres alone could serve<br/>analytics for years"]
+    A["Single Postgres store<br/>(TimescaleDB for analytics)"] --> A1["No dual-write, no reconciliation,<br/>no CP/AP split between two DBs"]
+    B["Scrapers never write the DB directly"] --> B1["Batched COPY via consumer<br/>avoids connection storms<br/>& lock contention"]
+    C["ON CONFLICT upsert on natural key"] --> C1["Idempotent + immediately consistent<br/>(replaces merge-time dedup)"]
+    D["Dual-write order:<br/>S3 → Postgres → delete SQS msg"] --> D1["Durable copy exists<br/>before anything can fail"]
+    E["Continuous aggregates +<br/>columnar compression"] --> E1["ClickHouse-like dashboard latency<br/>without a second store"]
+    F["Long scraper on-demand<br/>(not Spot)"] --> F1["Incremental stream +<br/>overlap guard + heartbeat"]
 
     style A fill:#0d1117,color:#fff
     style B fill:#0d1117,color:#fff
     style C fill:#0d1117,color:#fff
     style D fill:#0d1117,color:#fff
     style E fill:#0d1117,color:#fff
+    style F fill:#0d1117,color:#fff
 ```
 
-- **Scrapers never insert into ClickHouse directly** — batched inserts via the consumer avoid the *"too many parts"* failure.
-- **`ReplacingMergeTree` dedup** makes the whole pipeline idempotent and safely retryable.
-- **Dual-write order: S3 → ClickHouse → delete SQS message** — a durable copy exists before anything can fail.
+- **One database instead of two.** TimescaleDB gives Postgres columnar compression + auto-maintained rollups, so a single tuned instance serves both OLTP and OLAP. This **eliminates the dual-write, the Postgres↔ClickHouse reconciliation job, the merge-lag alarms, and the deliberate two-database CP/AP split.** Justified because at **~36M rows/year** a single Postgres easily serves analytics for years.
+- **Scrapers never write the database directly** — batched `COPY` via the consumer avoids connection storms and lock contention, and keeps inserts efficient.
+- **`ON CONFLICT (mls_id, listing_version) DO UPDATE`** makes ingestion idempotent and safely retryable — and unlike `ReplacingMergeTree`, dedup is **immediate and strongly consistent**, not resolved at a later merge.
+- **Dual-write order: S3 → Postgres → delete SQS message** — a durable copy exists before anything can fail; a crash before the delete simply redelivers and the upsert absorbs it.
+- **Dashboards read continuous aggregates off a read replica** — pre-rolled results, with analytical scan load isolated from the CP primary.
+- **Hot chunk stays uncompressed (mutable) for upserts; older chunks compress to columnar on a schedule** — recent data is writable, historical data is small and scan-fast.
 - **Long scraper runs on-demand (not Spot)** — streams incrementally, with an overlap guard and heartbeat.
-- **ClickHouse is justified only by query latency** — at ~36M rows/year Postgres alone could serve analytics for years.
 
 ### Dual-Write Sequence
 
@@ -126,41 +136,43 @@ sequenceDiagram
     participant SQS
     participant C as Batch Consumer
     participant S3
-    participant CH as ClickHouse
+    participant PG as Postgres/TimescaleDB
 
     SQS->>C: receive batch
-    C->>C: enrich from Postgres dimensions
+    C->>C: enrich via local dimension join
     C->>S3: 1. write Parquet (durable copy)
     S3-->>C: ack
-    C->>CH: 2. bulk insert (ReplacingMergeTree)
-    CH-->>C: ack
+    C->>PG: 2. COPY into hypertable + ON CONFLICT upsert
+    PG-->>C: ack (committed, consistent)
     C->>SQS: 3. delete message
-    Note over C,SQS: Crash before step 3 → message redelivered →<br/>dedup at merge time makes retry safe
+    Note over C,SQS: Crash before step 3 → message redelivered →<br/>ON CONFLICT upsert makes retry a no-op (idempotent)
 ```
+
+> **Hosting note:** RDS/Aurora **cannot** run the TimescaleDB extension (locked allowlist). This design therefore runs Postgres **self-managed on EC2** or on **Timescale Cloud**. If staying on vanilla RDS/Aurora is a hard requirement, fall back to the **native path** — declarative partitioning + BRIN indexes + materialized views — which is viable at this row count without any extension.
 
 ---
 
 ## 3. CAP Theorem
 
-Under a network partition you choose **Consistency OR Availability**. This system runs two subsystems with deliberately opposite choices.
+With a single Postgres store, the system is now **predominantly CP** — one strongly-consistent source of truth. Eventual consistency is confined to two bounded, deliberate surfaces.
 
 ```mermaid
 flowchart TB
     P{{"🌐 Network Partition"}}
 
-    subgraph CP["Transactional Core — CP"]
+    subgraph CP["Postgres + TimescaleDB primary — CP"]
         direction TB
-        PGN["Postgres single primary<br/>ACID for money & identity<br/>favors consistency over<br/>write availability"]
+        PGN["Single source of truth<br/>ACID for money, identity, AND analytics<br/>on partition favors consistency<br/>over write availability"]
     end
 
-    subgraph AP1["Analytics Pipeline — AP"]
+    subgraph AP1["Read replica — eventually consistent reads"]
         direction TB
-        APN["SQS → Consumer → ClickHouse<br/>prioritizes ingest throughput<br/>& read availability<br/>eventual consistency OK"]
+        RN["Async streaming replication<br/>dashboard reads may lag primary<br/>by bounded replication lag (seconds)"]
     end
 
-    subgraph AP2["Object Storage — AP + Durable"]
+    subgraph AP2["Ingestion pipeline + S3 — AP / durable"]
         direction TB
-        S3N["S3<br/>highly available<br/>strong read-after-write<br/>11 nines durability"]
+        APN["SQS → consumer buffers ingest<br/>dashboards lag until processed +<br/>continuous-aggregate refresh<br/>S3: 11 nines, strong read-after-write"]
     end
 
     P --> CP
@@ -168,17 +180,17 @@ flowchart TB
     P --> AP2
 
     style CP fill:#1f6feb,color:#fff
-    style AP1 fill:#d29922,color:#fff
+    style AP1 fill:#388bfd,color:#fff
     style AP2 fill:#238636,color:#fff
 ```
 
-| Subsystem | Choice | Rationale |
-|-----------|--------|-----------|
-| **Transactional core (Postgres)** | **CP** | ACID for money and identity; on partition the single primary favors consistency over write availability. |
-| **Analytics pipeline (SQS → consumer → ClickHouse)** | **AP** | Prioritizes ingest throughput and read availability; eventual consistency is acceptable (dashboards may lag seconds to minutes; dedup resolves at merge time). |
-| **Object storage (S3)** | **AP + Durable** | Highly available, strong read-after-write, 11 nines durability. |
+| Surface | Choice | Rationale |
+|---------|--------|-----------|
+| **Postgres/TimescaleDB primary** | **CP** | ACID for money, identity, **and analytics** in one place. On partition the single primary favors consistency over write availability. |
+| **Read replica (dashboard reads)** | **AP-on-reads** | Async streaming replication; reads stay available during primary stress but may lag by a bounded replication delay (typically seconds). |
+| **Ingestion pipeline (SQS → consumer) + S3** | **AP + durable** | The queue absorbs ingest; analytics is fresh only after the consumer commits and continuous aggregates refresh. S3: highly available, strong read-after-write, 11 nines durability. |
 
-**Net:** consistency where correctness is non-negotiable (invoicing, users), availability and eventual consistency where freshness can safely lag (analytics).
+**Net:** the old "two databases with opposite CP/AP choices" collapses into **one CP system of record**, with eventual consistency limited to (a) ingestion lag through the queue and (b) read-replica lag. Simpler to reason about, and analytics is now strongly consistent at the primary.
 
 ---
 
@@ -189,7 +201,7 @@ Sized for the **target operating point**:
 - **10–50 concurrent dashboard users**
 - **Scrapers run once per day**, ingesting **10k–50k records/day** (~3.6M–18M rows/year)
 
-> **Assumptions:** AWS `us-east-1`, on-demand pricing (no Reserved Instances or Savings Plans), Postgres **Multi-AZ** (it's the CP money/identity store), ClickHouse a **single EC2 node**, Dashboard API on **Fargate behind an ALB** with 2 small tasks. All figures are USD/month and rounded.
+> **Assumptions:** AWS `us-east-1`, on-demand pricing (no Reserved Instances or Savings Plans), Postgres + TimescaleDB **self-managed on EC2** with an **optional read replica** (RDS can't run TimescaleDB), Dashboard API on **Fargate behind an ALB** with 2 small tasks. All figures are USD/month and rounded.
 
 ### Monthly cost by component
 
@@ -198,91 +210,78 @@ Sized for the **target operating point**:
 | **Scrapers — Fargate** | 9× short on **Spot** + 1× long ~1.5h **On-Demand**, once/day | $5 | $15 | Runs minutes–hours/day, not 24/7. Spot makes the 9 short ones nearly free. |
 | **Batch consumer — Fargate** | small task, processes daily batch | $5 | $20 | 10–50k records is tiny; cost is "time running," not volume. |
 | **Dashboard API — Fargate + ALB** | 2× ~0.5 vCPU/1GB tasks, always-on, + ALB | $20 | $60 | ALB ~$16–20 is most of the floor. 10–50 users is light load. |
-| **Postgres — RDS Multi-AZ** | `db.t4g.small`→`medium`, + storage/backups | $50 | $120 | CP store; Multi-AZ ≈ 2× a single instance. Aurora Serverless v2 (min 0.5 ACU) lands in the same band. |
-| **ClickHouse — EC2** | 1× `c6i.xlarge` (4 vCPU/8 GB, min spec) → `m6i.xlarge` (4 vCPU/16 GB) + ~150 GB gp3 EBS | $125 | $145 | The single biggest line. Always-on. See [ClickHouse sizing](#clickhouse-ec2-sizing) below. A replica for HA roughly doubles this. |
+| **Postgres + TimescaleDB — EC2** | 1× `m6i.xlarge` primary (+ optional `m6i.large` read replica) + EBS gp3 | $130 | $280 | **Single biggest line, and now the only data store.** See [sizing](#postgres--timescaledb-sizing) below. Read replica ≈ +$70–90. |
 | **S3** | Parquet archive + PDFs | $1 | $8 | A few GB/year compressed. Storage + requests are trivial at this volume. |
 | **SQS + DLQ** | 0.3M–1.5M msgs/month | $0 | $2 | First 1M requests/month free; effectively free here. |
 | **Lambda** | PDF worker + Notifier triggers | $1 | $5 | Low invocation count; often within free tier. |
 | **SES / SNS** | client reminder emails / SMS | $1 | $10 | Email ~$0.10/1k; SMS is the variable — depends on volume/region. |
 | **EventBridge Scheduler** | ~10 triggers/day | $0 | $1 | Negligible. |
 | **Secrets Manager** | ~5–10 secrets | $2 | $5 | $0.40/secret/month + API calls. |
-| **VPC interface endpoints** | ECR, SQS, Secrets, CloudWatch… (no NAT) | $15 | $70 | ~$7.3/endpoint/AZ. Real cost — but the deliberate trade vs a NAT Gateway (~$32+/mo + data). S3/DynamoDB gateway endpoints are free. Single-AZ halves it. |
-| **CloudWatch** | logs, metrics, alarms (DLQ depth, merge lag) | $5 | $20 | Scales with log retention/verbosity. |
+| **VPC interface endpoints** | ECR, SQS, Secrets, CloudWatch… (no NAT) | $15 | $70 | ~$7.3/endpoint/AZ. The deliberate trade vs a NAT Gateway. Single-AZ halves it. |
+| **CloudWatch** | logs, metrics, alarms (DLQ depth, replication lag, cagg refresh) | $5 | $20 | Scales with log retention/verbosity. |
 | **Data transfer** | egress to users (dashboard, PDFs) | $1 | $10 | Mostly internal/in-AZ; user egress is modest. |
-| **Total** | | **≈ $230** | **≈ $495** | Realistic mid-point **≈ $300–420/month**. |
+| **Total** | | **≈ $185** | **≈ $505** | Realistic mid-point **≈ $270–400/month**. |
+
+> **vs the ClickHouse design:** two data stores (Postgres Multi-AZ $50–120 **+** ClickHouse EC2 $125–145) collapse into one Postgres+TimescaleDB line ($130–280). The dollar change is a modest wash-to-saving — **the real win is operational**: one database, no dual-write, no reconciliation job, fewer alarms, and strongly-consistent analytics.
 
 ### Reading the numbers
 
 ```mermaid
 pie showData title Approx. cost share (mid-range)
-    "ClickHouse (EC2)" : 135
-    "Postgres (Multi-AZ)" : 80
+    "Postgres + TimescaleDB (EC2)" : 190
     "Dashboard API + ALB" : 40
     "VPC endpoints" : 35
-    "CloudWatch" : 12
     "Scrapers + consumer" : 20
+    "CloudWatch" : 12
     "Everything else (S3/SQS/Lambda/SES/secrets)" : 18
 ```
 
-- **The workload is small; the bill is "always-on infrastructure," not data.** ~80% of cost is the three persistent components — **ClickHouse + Postgres + the Dashboard API/ALB** — all of which cost the same whether you ingest 10k or 50k records. The actual ingestion (scrapers, SQS, consumer, S3) is **under ~$30/month combined**.
-- **This reinforces decision §2:** at this scale "Postgres alone could serve analytics for years." Dropping the ClickHouse EC2 node would cut the bill by roughly **a third** — ClickHouse is a query-latency investment, not a capacity one yet.
-- **VPC interface endpoints are a quiet line item** (~$15–70). They're the cost of the "no NAT" decision; at low data-egress volume the trade is roughly break-even with a NAT Gateway, and you gain the security posture.
+- **The bill is "the database + always-on edges," not data volume.** The single Postgres+TimescaleDB instance is ~60–70% of cost, and it costs the same whether you ingest 10k or 50k records/day. Ingestion itself (scrapers, SQS, consumer, S3) stays **under ~$30/month combined**.
+- **This realizes §2's thesis directly:** one tuned Postgres serves analytics for years at this scale — so paying for a second columnar cluster was buying capacity you don't yet need.
+- **VPC interface endpoints remain a quiet line item** (~$15–70) — the cost of the "no NAT" decision.
 
-### ClickHouse EC2 sizing
+### Postgres + TimescaleDB sizing
 
-**Minimum spec: 4 vCPU / 8 GB RAM** — handles lightweight analytics with basic aggregations. That's the compute-optimized (1:2 vCPU:RAM) `xlarge` class. Pricing in `us-east-1`, on-demand, 730 hrs/month:
+The instance now carries **both** the transactional load **and** analytics, and OLAP work is memory-hungry — so favor RAM. The 1:4 vCPU:RAM ratio (the `m`/`r` families) is the right shape. Pricing in `us-east-1`, on-demand, 730 hrs/month:
 
-| Instance | vCPU / RAM | $/hr | Compute/mo | Notes |
-|----------|-----------|-----:|-----------:|-------|
-| `c6a.xlarge` (AMD) | 4 / 8 GB | $0.1531 | **~$112** | Cheapest exact match for the min spec |
-| `c6i.xlarge` (Intel) | 4 / 8 GB | $0.170 | **~$124** | Common default |
-| `c7i.xlarge` (Intel, newest) | 4 / 8 GB | $0.1785 | **~$130** | Best perf/$ on current gen |
-| `m6i.xlarge` (general) | 4 / **16 GB** | $0.192 | **~$140** | **Recommended** — same vCPU, 2× RAM for only ~$15/mo more |
-| `t3.xlarge` (burstable) | 4 / 16 GB | $0.1664 | ~$121 | Avoid — burstable CPU stalls under steady CH load |
+| Instance | vCPU / RAM | $/hr | Compute/mo | Role |
+|----------|-----------|-----:|-----------:|------|
+| `m6i.large` | 2 / 8 GB | $0.096 | ~$70 | Read replica (serves pre-rolled aggregates) |
+| `m6i.xlarge` ⭐ | 4 / 16 GB | $0.192 | ~$140 | **Recommended primary minimum** — handles OLTP + TimescaleDB analytics |
+| `r6i.xlarge` | 4 / **32 GB** | $0.252 | ~$184 | Primary with OLAP headroom (large aggregations, more concurrency) |
+| `r6i.2xlarge` | 8 / 64 GB | $0.504 | ~$368 | Only if dashboards get heavy or data grows past plan |
 
-Plus required **EBS gp3** data volume at $0.08/GB-month: 100 GB → +$8, 200 GB → +$16.
+Plus required **EBS gp3** at $0.08/GB-month (TimescaleDB columnar compression keeps this small — typically ~90% smaller than raw): 100 GB → +$8, 200 GB → +$16.
 
-**All-in (compute + ~150 GB EBS):**
+**All-in:**
 
-| Pricing | Monthly |
-|---------|--------:|
-| On-Demand | **~$125–145** |
-| 1-yr Savings Plan (~37% off) | ~$85–100 |
-| 3-yr Savings Plan (~60% off) | ~$60–75 |
+| Topology | Monthly (compute + EBS) |
+|----------|------------------------:|
+| Primary only (`m6i.xlarge` + 200 GB) | **~$156** |
+| Primary + read replica (`m6i.xlarge` + `m6i.large`) | **~$234** |
+| 1-yr Savings Plan (~37% off compute) | **−$50–90** off the above |
+| Managed alternative — **Timescale Cloud** (HA + replica) | **~$130–350** depending on size |
 
-> **Sizing caveat:** 4 vCPU / **8 GB** satisfies the stated minimum, but ClickHouse is memory-hungry — large aggregations, JOINs, and background merges consume RAM and will spill to disk (slower) or OOM when 8 GB runs short. For headroom, prefer **`m6i.xlarge` (4 vCPU / 16 GB)** — same core count, double the RAM, only ~$15/mo more. The cost line above brackets `c6i.xlarge` (8 GB floor) → `m6i.xlarge` (16 GB recommended).
-
-### Levers if you need to trim
-
-| Lever | Approx. saving | Trade-off |
-|-------|----------------|-----------|
-| Reserved Instances / Savings Plans on RDS + ClickHouse EC2 | **−30–40%** on those lines (~$50–100/mo) | 1–3yr commitment |
-| Drop Postgres to single-AZ | **−$25–60/mo** | loses HA on the CP store — **not recommended** |
-| Move Dashboard API to **Lambda + RDS Proxy** | **−$10–30/mo** if traffic is bursty | RDS Proxy floor ~$11/mo; cold starts |
-| Single-AZ VPC endpoints | **−$8–35/mo** | reduced endpoint AZ-redundancy |
-| Defer ClickHouse, serve analytics from Postgres | **−$70–150/mo** | revisit once query latency actually demands a columnar store |
-
-> **Excluded:** one-time setup/data-migration, developer/CI environments, support plans, and any third-party MLS/data-source licensing. A non-prod (single-AZ, no replicas, Spot-heavy) copy of this stack typically runs **~40–50% of prod**.
+> **Why the read replica:** at 10–50 users you *can* run primary-only and skip it (~$80/mo cheaper), but a replica isolates analytical scans from the money/identity workload and gives read-side HA. It's the single best ~$80/mo you can spend here.
 
 ---
 
 ## 5. Alternative: Cloudflare Infrastructure
 
-The same architecture re-platformed onto **Cloudflare Workers** and its ecosystem. The model is fundamentally different from AWS: instead of always-on VMs/containers in a VPC, almost everything is **serverless, edge-distributed, and scales to zero**. That flips the cost structure — but two of our stateful stores (Postgres, ClickHouse) have **no first-party Cloudflare equivalent** and must stay external.
+The same architecture re-platformed onto **Cloudflare Workers**. The model is fundamentally different from AWS: almost everything is **serverless, edge-distributed, and scales to zero** — which flips the cost structure. But with a single-Postgres design, **the heart of the system (Postgres + TimescaleDB) has no first-party Cloudflare equivalent**, so it must stay external. That means Cloudflare contributes the *edge/ingest/serving* tier, not the database.
 
 ### Service mapping (AWS → Cloudflare)
 
 | AWS component | Cloudflare equivalent | Fit |
 |---------------|----------------------|-----|
 | EventBridge Scheduler | **Cron Triggers** (on a Worker) | ✅ Clean |
-| Short scrapers (Fargate Spot) | **Workers** | ⚠️ Workers cap CPU time (≤5 min); fine for short scrapes, but no long-running process model |
-| Long scraper ~1.5h (Fargate On-Demand) | **Cloudflare Containers** (or chunked via **Durable Object** alarms) | ⚠️ Doesn't fit the Workers model — needs Containers (per-second billed) or work split into DO-alarm chunks |
+| Short scrapers (Fargate Spot) | **Workers** | ⚠️ Workers cap CPU time (≤5 min); fine for short scrapes |
+| Long scraper ~1.5h | **Cloudflare Containers** (or chunked **Durable Object** alarms) | ⚠️ Doesn't fit the Workers model — needs Containers or DO-alarm chunks |
 | SQS + DLQ | **Cloudflare Queues** (built-in DLQ/retries) | ✅ Clean |
 | Batch consumer (Fargate) | **Workers** (Queue consumer, batched) | ✅ Clean |
-| Postgres (RDS/Aurora) | **No native Postgres.** External (Neon/Supabase) via **Hyperdrive** pooling, *or* **D1** (SQLite) | ❌ No managed Postgres. D1 ≠ Postgres semantics; real ACID core stays external |
-| ClickHouse (EC2) | **No native OLAP.** **Workers Analytics Engine** (time-series, SQL API) *or* external ClickHouse Cloud | ❌ Biggest gap. Analytics Engine covers basic aggregations but isn't a ClickHouse replacement |
+| **Postgres + TimescaleDB** | **No native Postgres / no TimescaleDB.** External (Timescale Cloud / self-host) via **Hyperdrive** pooling | ❌ The whole data store is external. D1 (SQLite) has **no hypertables, columnar, or continuous aggregates** |
 | S3 | **R2** (S3-compatible, **zero egress fees**) | ✅ Better — no egress cost |
-| Dashboard API (Bun/Hono Fargate) | **Workers** — **Hono runs natively on Workers** | ✅ Excellent — same framework, no rewrite |
+| Dashboard API (Bun/Hono) | **Workers** — **Hono runs natively on Workers** | ✅ Excellent — same framework, no rewrite |
 | PDF worker (Lambda) | **Workers + Browser Rendering API** | ✅ Clean |
 | Notifier (SES/SNS) | **Email Routing** (inbound) + external send (Resend/SES) | ⚠️ No native bulk email send |
 | Secrets Manager | **Workers Secrets / Secrets Store** | ✅ Clean |
@@ -298,17 +297,15 @@ flowchart TB
         WS["Scraper Workers<br/>(9 short)"]
         CONT["Container / Durable Object<br/>(1 long scraper ~1.5h)"]
         Q["Cloudflare Queues<br/>(+ built-in DLQ)"]
-        CONS["Consumer Worker<br/>enrich · insert · archive"]
+        CONS["Consumer Worker<br/>enrich · upsert · archive"]
         API["Dashboard API<br/>Hono on Workers"]
-        AE[("Analytics Engine<br/>aggregations")]
         R2[("R2<br/>Parquet + PDFs<br/>zero egress")]
         PDF["PDF Worker<br/>+ Browser Rendering"]
         HD["Hyperdrive<br/>(pooling/cache)"]
     end
 
     subgraph External["🔌 External (no CF-native option)"]
-        PG[("Postgres<br/>Neon / Supabase — CP")]
-        CH[("ClickHouse Cloud<br/>or self-host VM")]
+        PG[("Postgres + TimescaleDB<br/>Timescale Cloud / self-host<br/>core + analytics + replica")]
         MAIL["Resend / SES<br/>(email send)"]
     end
 
@@ -319,11 +316,8 @@ flowchart TB
     CONT --> Q
     Q --> CONS
     CONS --> R2
-    CONS --> AE
-    CONS -. or external .-> CH
     CONS --> HD --> PG
     API --> HD
-    API --> AE
     API --> R2
     API --> Users
     API --> PDF --> R2
@@ -331,8 +325,6 @@ flowchart TB
 
     style R2 fill:#238636,color:#fff
     style PG fill:#1f6feb,color:#fff
-    style CH fill:#d29922,color:#fff
-    style AE fill:#d29922,color:#fff
     style External fill:#161b22,color:#fff
 ```
 
@@ -340,39 +332,37 @@ flowchart TB
 
 Two Cloudflare variants, same workload (10–50 users, once-daily ingest of 10–50k records). All USD/month.
 
-| Component | AWS (from §4) | **CF-native** (Analytics Engine + D1) | **CF + external Postgres/ClickHouse** (faithful) |
-|-----------|--------------:|--------------------------------------:|------------------------------------------------:|
+| Component | AWS (from §4) | **CF-native** (D1 only) | **CF + external Timescale** (faithful) |
+|-----------|--------------:|------------------------:|---------------------------------------:|
 | Compute (API + scrapers + consumer + PDF) | $30–95 | **$5** Workers Paid base¹ | **$5** Workers Paid base¹ |
 | Long-scraper runtime | (in above) | $5–15 Containers | $5–15 Containers |
 | Queue | $0–2 | $0–1 Queues | $0–1 Queues |
 | Object storage | $1–8 | $1–3 R2 (no egress) | $1–3 R2 (no egress) |
-| Transactional store | $50–120 | $0–5 D1 | $19–69 Neon/Supabase + Hyperdrive (free) |
-| Analytics / OLAP store | $125–145 | $1–7 Analytics Engine | $50–200 ClickHouse Cloud / self-host |
+| **Data store (txn + OLAP)** | $130–280 PG+Timescale | $0–10 D1 ⚠️ **no Timescale/OLAP** | $130–350 Timescale Cloud / self-host + Hyperdrive (free) |
 | Email | $1–10 | $0–20 Resend/SES | $0–20 Resend/SES |
 | Secrets / observability | $7–25 | $0–3 (mostly included) | $0–3 (mostly included) |
 | VPC endpoints / NAT / ALB | $35–130 | **$0** (no VPC, no LB) | **$0** |
-| **Total** | **≈ $300–420** | **≈ $15–55/month** | **≈ $80–300/month** |
+| **Total** | **≈ $270–400** | **≈ $15–55/month** ⚠️ | **≈ $145–390/month** |
 
-¹ Workers Paid is $5/mo and includes 10M requests + 30M CPU-ms — far above this workload's needs, so all Worker-based components share that one base fee.
+¹ Workers Paid is $5/mo and includes 10M requests + 30M CPU-ms — far above this workload, so all Worker-based components share that one base fee.
 
 ### Trade-offs
 
 **Where Cloudflare wins**
-- **Cost & elasticity at this scale.** No always-on Postgres Multi-AZ, ClickHouse EC2, ALB, or VPC endpoints — the four lines that dominate the AWS bill. Idle time costs ~nothing; the CF-native path is **~10–20× cheaper**.
+- **No VPC/NAT/endpoint/ALB tax** — eliminates $35–130/mo of pure AWS plumbing.
 - **R2 zero egress** — meaningful once dashboards/PDFs are served at volume.
 - **Hono runs unchanged on Workers** — the Dashboard API ports with little to no rewrite.
-- **No VPC/NAT/endpoint tax**, no instance patching, global edge latency for free.
+- **Edge tier scales to zero** — ingest/serving cost ~nothing when idle.
 
-**Where Cloudflare hurts**
-- **No managed Postgres.** Your **CP money/identity core** either moves to D1 (SQLite — different consistency/SQL semantics, read-replica eventual consistency) or stays on **external Postgres** (Neon/Supabase) reached via Hyperdrive. The faithful path keeps Postgres external, so it's "Cloudflare for the edge, someone else for the system of record."
-- **No managed ClickHouse.** **Analytics Engine** handles basic time-series aggregations (the stated "lightweight analytics" need) but is **not** a ClickHouse replacement — no `ReplacingMergeTree` dedup, narrower query surface, different data model. Faithful parity means an **external ClickHouse**, which erases much of the savings.
-- **Long-running scrapers fight the Workers model.** The 1.5h job needs **Containers** or must be re-architected into **Durable Object alarm chunks** with the heartbeat/overlap-guard logic rebuilt.
-- **CAP picture shifts.** The AWS design's crisp "Postgres = CP, pipeline = AP" split blurs: Workers/Queues/R2/Analytics Engine are all edge-AP, and D1's primary-plus-replica model has its own eventual-consistency behavior on reads.
+**Where Cloudflare hurts (more than in the ClickHouse design)**
+- **The data store — now the entire heart of the system — has no Cloudflare equivalent.** With a single-Postgres design there's no "second store to relocate"; the one store that matters is Postgres + TimescaleDB, and it must live on **Timescale Cloud or self-host**. Cloudflare can only front it via **Hyperdrive**.
+- **CF-native (D1) is a real downgrade, not a port.** D1 is SQLite — **no hypertables, no columnar compression, no continuous aggregates**. It only works if "analytics" stays trivial; you lose the exact features that justified TimescaleDB.
+- **Long-running scrapers fight the Workers model** — the 1.5h job needs **Containers** or **Durable Object alarm chunks** with the heartbeat/overlap-guard logic rebuilt.
 
 ### Verdict
 
-- **If "lightweight analytics with basic aggregations" is the real long-term ceiling** → the **CF-native** path (Workers + Queues + R2 + Analytics Engine + D1) is dramatically cheaper (**~$15–55/mo**) and operationally simpler. This aligns with §2's own observation that ClickHouse isn't yet justified by data volume.
-- **If you need true ClickHouse semantics and Postgres ACID guarantees** → use **Cloudflare for the edge/ingest/serving tier** and keep **Postgres + ClickHouse external** (**~$80–300/mo**). You still shed the VPC/NAT/ALB tax and gain R2's zero egress, but the stateful stores — and most of the cost — live elsewhere.
-- **Net:** Cloudflare is the stronger fit precisely *because* this workload is small and bursty. AWS earns its premium only when you genuinely need the managed, always-on, strongly-consistent stores (RDS Multi-AZ, self-tuned ClickHouse) that Cloudflare doesn't natively provide.
+- **The single-Postgres decision moves the center of gravity to the database**, and Cloudflare doesn't host it. So Cloudflare is best read as an **edge/compute layer in front of an external Postgres + TimescaleDB** (~$145–390/mo): you shed the VPC/NAT/ALB tax and gain R2 zero-egress and a native Hono runtime, but the database (and most of the cost) lives elsewhere on Timescale Cloud or a self-managed host.
+- **The cheap CF-native path (~$15–55, D1) is only honest if your analytics never outgrows SQLite** — which contradicts choosing TimescaleDB in the first place. Don't pick it unless you're consciously dropping the OLAP requirement.
+- **Net:** versus the old ClickHouse design, Cloudflare's dramatic savings shrink — because we already collapsed two stores into one, there's no second store for Cloudflare to make disappear. Use Cloudflare here for the **edge/ingest/serving tier**; keep **Postgres + TimescaleDB** on the platform that runs it best (self-managed EC2, or Timescale Cloud).
 
-> **Pricing note:** Cloudflare figures use public list pricing (Workers Paid $5/mo base, Queues ~$0.40/M ops, R2 $0.015/GB + $0 egress, D1/Analytics Engine within or just above included tiers at this volume). Containers and Browser Rendering bill per resource-second/request and are estimated at low daily usage. External Postgres/ClickHouse/email are third-party list prices.
+> **Pricing note:** Cloudflare figures use public list pricing (Workers Paid $5/mo base, Queues ~$0.40/M ops, R2 $0.015/GB + $0 egress, D1 within included tiers at this volume). Containers and Browser Rendering bill per resource-second/request and are estimated at low daily usage. External Postgres/TimescaleDB/email are third-party list prices.
